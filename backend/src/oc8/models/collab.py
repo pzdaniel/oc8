@@ -6,7 +6,7 @@ import datetime as dt
 import uuid
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, Text, UniqueConstraint, Uuid
+from sqlalchemy import CheckConstraint, DateTime, Index, Text, UniqueConstraint, Uuid, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -39,8 +39,20 @@ class Handoff(Base, PkMixin, TenantMixin, TimestampMixin):
     gate: Mapped[str] = mapped_column(Text, nullable=False, default="auto")
     created_by: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
     expires_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    #: Exact-once key for a handoff an AGENT emitted (collab.emit): source task,
+    #: binding and mapped payload. NULL for every other origin. Unique per
+    #: tenant through `uq_handoff_idempotency` (migration 0097), so two runs of
+    #: the same task emitting at once cannot both create one.
+    idempotency_key: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
+        Index(
+            "uq_handoff_idempotency",
+            "tenant_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
         CheckConstraint(
             "status IN ('pending','accepted','in_progress','completed','rejected','expired')",
             name="ck_handoff_status",

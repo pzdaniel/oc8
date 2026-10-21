@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from typing import Any
 
-from sqlalchemy import cast, select
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from oc8 import models as m
@@ -33,8 +35,9 @@ async def emit_event(
     """Create one pending handoff per matching binding whose target takes it in.
 
     `source_task_id` is set when an AGENT emits (control tool `emit_event`):
-    it is recorded on the handoff, and an identical handoff this same task
-    already produced is returned instead of being created again. A run that is
+    it is recorded on the handoff, and the same emission along the same
+    binding from this task is returned instead of being created again
+    (`idempotency_key`, enforced by a unique index). A run that is
     resumed re-runs from the start, so without this every resume of a run that
     emitted before parking would hand the same work over a second time.
     """
@@ -85,29 +88,107 @@ async def emit_event(
             )
             continue
         mapped = apply_payload_map(binding.payload_map, payload)
-        if source_task_id is not None:
-            existing = await db.scalar(
-                select(m.Handoff).where(
-                    m.Handoff.source_task_id == source_task_id,
-                    m.Handoff.source_department_id == source_department.id,
-                    m.Handoff.target_department_id == target.id,
-                    m.Handoff.handoff_type_id == handoff_type.id,
-                    m.Handoff.payload == cast(mapped, JSONB),
-                )
+        if source_task_id is None:
+            handoff = await create_handoff(
+                db,
+                tenant_id=tenant_id,
+                handoff_type=handoff_type,
+                source_department_id=source_department.id,
+                target_department_id=target.id,
+                payload=mapped,
+                created_by=created_by,
+                gate=binding.gate,
             )
-            if existing is not None:
-                created.append(existing)
-                continue
-        handoff = await create_handoff(
-            db,
-            tenant_id=tenant_id,
-            handoff_type=handoff_type,
-            source_department_id=source_department.id,
-            target_department_id=target.id,
-            payload=mapped,
-            created_by=created_by,
-            source_task_id=source_task_id,
-            gate=binding.gate,
-        )
+        else:
+            handoff = await _create_once(
+                db,
+                tenant_id=tenant_id,
+                key=idempotency_key(
+                    source_task_id=source_task_id,
+                    binding_id=binding.id,
+                    event_type=event_type,
+                    mapped_payload=mapped,
+                ),
+                handoff_type=handoff_type,
+                source_department_id=source_department.id,
+                target_department_id=target.id,
+                payload=mapped,
+                created_by=created_by,
+                source_task_id=source_task_id,
+                gate=binding.gate,
+            )
         created.append(handoff)
     return created
+
+
+def idempotency_key(
+    *,
+    source_task_id: uuid.UUID,
+    binding_id: uuid.UUID,
+    event_type: str,
+    mapped_payload: dict[str, Any],
+) -> str:
+    """Identity of ONE emission along ONE contract route.
+
+    The binding is part of it (and, for readability, the event it is bound
+    to): two different events of the same task that happen to map to the same
+    target, handoff type and payload are two routes, not a replay, and must
+    both arrive. The payload is the MAPPED one -- what the receiver actually
+    gets -- canonicalised so key order cannot make one emission look like two.
+    """
+    digest = hashlib.sha256(
+        json.dumps(mapped_payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+    return f"emit:{source_task_id}:{binding_id}:{event_type}:{digest}"
+
+
+async def _by_key(db: AsyncSession, key: str) -> m.Handoff | None:
+    found: m.Handoff | None = await db.scalar(
+        select(m.Handoff).where(m.Handoff.idempotency_key == key)
+    )
+    return found
+
+
+async def _create_once(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    key: str,
+    handoff_type: m.HandoffType,
+    source_department_id: uuid.UUID,
+    target_department_id: uuid.UUID,
+    payload: dict[str, Any],
+    created_by: uuid.UUID,
+    source_task_id: uuid.UUID,
+    gate: str,
+) -> m.Handoff:
+    """Create the handoff for `key`, or return the one that already exists.
+
+    The lookup first is only the cheap path for a replay; what makes it
+    exact-once is `uq_handoff_idempotency`. Two runs racing past the lookup
+    both insert, the second blocks on the index until the first commits, gets
+    the unique violation, and -- its savepoint rolled back, nothing else of its
+    transaction lost -- returns the first one's row instead.
+    """
+    existing = await _by_key(db, key)
+    if existing is not None:
+        return existing
+    try:
+        async with db.begin_nested():
+            return await create_handoff(
+                db,
+                tenant_id=tenant_id,
+                handoff_type=handoff_type,
+                source_department_id=source_department_id,
+                target_department_id=target_department_id,
+                payload=payload,
+                created_by=created_by,
+                source_task_id=source_task_id,
+                gate=gate,
+                idempotency_key=key,
+            )
+    except IntegrityError:
+        winner = await _by_key(db, key)
+        if winner is None:
+            raise
+        return winner

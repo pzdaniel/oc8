@@ -722,7 +722,13 @@ def emit_event_tool(emits: Sequence[str] = ()) -> NeutralTool:
     if emits:
         event_type["enum"] = list(emits)
     return NeutralTool(
-        name="emit_event",
+        # Not "emit_event": a core tool name is matched BEFORE any connection's
+        # tools (execute_control_tool runs first, and CONTROL_TOOL_NAMES is a
+        # flat namespace shared with every MCP server), so a generic verb an
+        # event-bus connection might well expose itself would be hijacked.
+        # Same convention as delegate_task / request_decision: a name that says
+        # what the PLATFORM does.
+        name="handoff_to_department",
         description=_EMIT_EVENT_DESCRIPTION,
         parameters={
             "type": "object",

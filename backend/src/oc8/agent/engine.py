@@ -23,6 +23,7 @@ from oc8 import models as m
 from oc8.agent import cache_flow
 from oc8.agent.control_tools import (
     DEPTH_LIMIT_REASON,
+    EMIT_EVENT,
     MAX_DELEGATION_DEPTH,
     authorize_emit,
     execute_control_tool,
@@ -428,7 +429,7 @@ def _authorize(
         if delegation_depth + 1 > MAX_DELEGATION_DEPTH:
             return Decision(Effect.DENY, DEPTH_LIMIT_REASON)
         return Decision(Effect.ALLOW)
-    if tc.name == "emit_event":
+    if tc.name == EMIT_EVENT.name:
         # Decided against the contract on the department frame, never against
         # a connection: it belongs to none, and falling through would DENY
         # every call (and audit it as such). What it may emit is the frame's

@@ -2138,7 +2138,7 @@ async def test_a_connection_without_requirements_is_launched_verbatim(
     assert launched[-1] == ("python", ["-m", "bridge"])
 
 
-async def test_emit_event_is_offered_and_hands_over_through_the_gateway(
+async def test_handoff_to_department_is_offered_and_hands_over_through_the_gateway(
     app_session: AppSessionFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Container-run agents are the ones doing the work, so the contract route to
@@ -2179,14 +2179,14 @@ async def test_emit_event_is_offered_and_hands_over_through_the_gateway(
     tok = _token(tenant, agent_id, run_id)
 
     _c, listed = await _rpc(tok, "tools/list")
-    [tool] = [t for t in listed["result"]["tools"] if t["name"] == "emit_event"]
+    [tool] = [t for t in listed["result"]["tools"] if t["name"] == "handoff_to_department"]
     assert tool["inputSchema"]["properties"]["event_type"]["enum"] == ["einkauf.artikel.fehlt"]
 
     code, body = await _rpc(
         tok,
         "tools/call",
         {
-            "name": "emit_event",
+            "name": "handoff_to_department",
             "arguments": {"event_type": "einkauf.artikel.fehlt", "payload": {"artikel": "BP 25"}},
         },
     )
@@ -2195,7 +2195,7 @@ async def test_emit_event_is_offered_and_hands_over_through_the_gateway(
     _c, refused = await _rpc(
         tok,
         "tools/call",
-        {"name": "emit_event", "arguments": {"event_type": "anderes", "payload": {}}},
+        {"name": "handoff_to_department", "arguments": {"event_type": "anderes", "payload": {}}},
     )
     assert refused["result"].get("isError") is True
 
@@ -2209,7 +2209,7 @@ async def test_emit_event_is_offered_and_hands_over_through_the_gateway(
         assert [r.id for r in runs] == [run_id], "no work was started anywhere"
 
 
-async def test_emit_event_is_not_offered_without_emits_in_the_contract(
+async def test_handoff_to_department_is_not_offered_without_emits_in_the_contract(
     app_session: AppSessionFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tenant = uuid.uuid4()
@@ -2218,4 +2218,4 @@ async def test_emit_event_is_not_offered_without_emits_in_the_contract(
     monkeypatch.setattr("oc8.agent.mcp_client.McpSession", _FakeMcp)
 
     _c, listed = await _rpc(_token(tenant, agent_id, run_id), "tools/list")
-    assert "emit_event" not in [t["name"] for t in listed["result"]["tools"]]
+    assert "handoff_to_department" not in [t["name"] for t in listed["result"]["tools"]]

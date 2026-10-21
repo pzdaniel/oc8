@@ -11,6 +11,7 @@ accepts. These tests pin that the tool can do exactly that and nothing more.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
@@ -27,6 +28,7 @@ from oc8.agent.control_tools import (
 )
 from oc8.agent.engine import _authorize
 from oc8.authz.pdp import Decision, Effect
+from oc8.collab.emit import emit_event
 from oc8.collab.handoff import create_handoff_type
 from oc8.modelrouter import ToolCall
 from tests.conftest import AppSessionFactory
@@ -324,3 +326,74 @@ async def test_the_engine_pep_decides_it_against_the_contract_not_a_connection()
     assert allowed == Decision(Effect.ALLOW)
     denied = _authorize(agent, _call(**ARGS), frame={"emits": ["anderes"]}, **common)
     assert denied.effect is Effect.DENY
+
+
+async def test_two_different_events_to_the_same_place_are_two_handoffs(
+    app_session: AppSessionFactory,
+) -> None:
+    """Same task, same target, same handoff type, same mapped payload -- but two
+    different events along two bindings. That is two routes, not a replay."""
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, stamm, agent, task = await _setup(db, tenant)
+        other_event = "einkauf.artikel.veraltet"
+        einkauf.frame = {"emits": [EVENT, other_event]}
+        ht = (
+            await db.execute(select(m.HandoffType).where(m.HandoffType.name == HANDOFF))
+        ).scalar_one()
+        db.add(
+            m.ContractBinding(
+                tenant_id=tenant,
+                event_type=other_event,
+                handoff_type_id=ht.id,
+                source_department_id=einkauf.id,
+                target_department_id=stamm.id,
+                payload_map={"artikel": "$.artikel", "lieferant": "$.lieferant"},
+            )
+        )
+        await db.flush()
+        await _emit(db, tenant, agent, task, einkauf.frame)
+        await _emit(db, tenant, agent, task, einkauf.frame, {**ARGS, "event_type": other_event})
+        handoffs = await _handoffs(db)
+        assert len(handoffs) == 2
+        assert handoffs[0].payload == handoffs[1].payload
+        assert handoffs[0].idempotency_key != handoffs[1].idempotency_key
+
+
+async def test_two_runs_emitting_at_the_same_moment_create_one_handoff(
+    app_session: AppSessionFactory,
+) -> None:
+    """A read-then-insert check alone lets both through; the unique index does
+    not. The second transaction waits on the first, then gets its row back."""
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, _stamm, agent, task = await _setup(db, tenant)
+        dept_id, agent_id, task_id = einkauf.id, agent.id, task.id
+
+    entered = asyncio.Event()
+
+    async def one_run(hold: float) -> uuid.UUID:
+        async with app_session(tenant) as db:
+            dept = await db.get(m.Department, dept_id)
+            assert dept is not None
+            [h] = await emit_event(
+                db,
+                tenant_id=tenant,
+                source_department=dept,
+                event_type=EVENT,
+                payload=ARGS["payload"],
+                created_by=agent_id,
+                source_task_id=task_id,
+            )
+            entered.set()
+            await asyncio.sleep(hold)  # keep the first transaction open
+            return h.id
+
+    async def second_run() -> uuid.UUID:
+        await entered.wait()  # start while the first is inserted but uncommitted
+        return await one_run(0)
+
+    first, second = await asyncio.gather(one_run(0.5), second_run())
+    assert first == second
+    async with app_session(tenant) as db:
+        assert len(await _handoffs(db)) == 1
