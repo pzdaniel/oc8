@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select
@@ -22,6 +23,20 @@ from oc8.collab.contracts import (
 from oc8.collab.handoff import create_handoff
 
 
+@dataclass(frozen=True)
+class EmitOutcome:
+    """What one emission produced: every handoff it resolved to, and which of
+    those already existed (a replay of the same emission along the same
+    route), so a caller can tell "handed over" from "had been handed over"."""
+
+    handoffs: list[m.Handoff]
+    replayed_ids: frozenset[uuid.UUID]
+
+    @property
+    def new(self) -> list[m.Handoff]:
+        return [h for h in self.handoffs if h.id not in self.replayed_ids]
+
+
 async def emit_event(
     db: AsyncSession,
     *,
@@ -33,6 +48,32 @@ async def emit_event(
     source_task_id: uuid.UUID | None = None,
 ) -> list[m.Handoff]:
     """Create one pending handoff per matching binding whose target takes it in.
+
+    The handoffs only; `emit_event_outcome` also says which were replays.
+    """
+    outcome = await emit_event_outcome(
+        db,
+        tenant_id=tenant_id,
+        source_department=source_department,
+        event_type=event_type,
+        payload=payload,
+        created_by=created_by,
+        source_task_id=source_task_id,
+    )
+    return outcome.handoffs
+
+
+async def emit_event_outcome(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    source_department: m.Department,
+    event_type: str,
+    payload: dict[str, Any],
+    created_by: uuid.UUID,
+    source_task_id: uuid.UUID | None = None,
+) -> EmitOutcome:
+    """`emit_event`, plus which handoffs already existed.
 
     `source_task_id` is set when an AGENT emits (control tool `emit_event`):
     it is recorded on the handoff, and the same emission along the same
@@ -73,6 +114,7 @@ async def emit_event(
     )
 
     created: list[m.Handoff] = []
+    replayed: set[uuid.UUID] = set()
     for binding in bindings:
         target = await db.get(m.Department, binding.target_department_id, populate_existing=True)
         handoff_type = await db.get(m.HandoffType, binding.handoff_type_id, populate_existing=True)
@@ -104,7 +146,7 @@ async def emit_event(
                 gate=binding.gate,
             )
         else:
-            handoff = await _create_once(
+            handoff, inserted = await _create_once(
                 db,
                 tenant_id=tenant_id,
                 key=idempotency_key(
@@ -121,8 +163,10 @@ async def emit_event(
                 source_task_id=source_task_id,
                 gate=binding.gate,
             )
+            if not inserted:
+                replayed.add(handoff.id)
         created.append(handoff)
-    return created
+    return EmitOutcome(handoffs=created, replayed_ids=frozenset(replayed))
 
 
 def idempotency_key(
@@ -165,8 +209,10 @@ async def _create_once(
     created_by: uuid.UUID,
     source_task_id: uuid.UUID,
     gate: str,
-) -> m.Handoff:
+) -> tuple[m.Handoff, bool]:
     """Create the handoff for `key`, or return the one that already exists.
+
+    The flag says which: True only when THIS call inserted the row.
 
     The lookup first is only the cheap path for a replay; what makes it
     exact-once is `uq_handoff_idempotency`. Two runs racing past the lookup
@@ -176,10 +222,10 @@ async def _create_once(
     """
     existing = await _by_key(db, key)
     if existing is not None:
-        return existing
+        return existing, False
     try:
         async with db.begin_nested():
-            return await create_handoff(
+            handoff = await create_handoff(
                 db,
                 tenant_id=tenant_id,
                 handoff_type=handoff_type,
@@ -191,8 +237,9 @@ async def _create_once(
                 gate=gate,
                 idempotency_key=key,
             )
+        return handoff, True
     except IntegrityError:
         winner = await _by_key(db, key)
         if winner is None:
             raise
-        return winner
+        return winner, False

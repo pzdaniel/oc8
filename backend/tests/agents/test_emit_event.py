@@ -27,6 +27,7 @@ from oc8.agent.control_tools import (
     offered_tools,
 )
 from oc8.agent.engine import _authorize
+from oc8.agent.tool_idempotency import REPLAY_NOTE
 from oc8.authz.pdp import Decision, Effect
 from oc8.collab.emit import emit_event
 from oc8.collab.handoff import create_handoff_type
@@ -427,3 +428,42 @@ async def test_an_event_revoked_while_the_run_is_going_is_refused(
         output = await _emit(run_db, tenant, run_agent, run_task, frame_at_start)
         assert output.startswith("ERROR:"), output
         assert await _handoffs(run_db) == []
+
+
+async def test_a_replay_says_so_and_is_not_recorded_as_a_second_handover(
+    app_session: AppSessionFactory,
+) -> None:
+    """Same convention as tool_idempotency: the model is told explicitly that
+    NO second action was taken, and audit/activity count the handover once."""
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, _stamm, agent, task = await _setup(db, tenant)
+        first = await _emit(db, tenant, agent, task, einkauf.frame)
+        second = await _emit(db, tenant, agent, task, einkauf.frame)
+
+        assert REPLAY_NOTE not in first
+        assert first.startswith("Übergeben an")
+        assert REPLAY_NOTE in second
+        assert not second.startswith("Übergeben an")
+        allows = (
+            (
+                await db.execute(
+                    select(m.AuditEvent).where(
+                        m.AuditEvent.action == f"emit:{EVENT}", m.AuditEvent.decision == "allow"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(allows) == 1
+        activities = (
+            (
+                await db.execute(
+                    select(m.ActivityEvent).where(m.ActivityEvent.message.like("Übergabe an%"))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(activities) == 1

@@ -1211,7 +1211,8 @@ async def _emit(
     against the department row as it is NOW, because the frame the caller
     authorised against may have been read at the start of a long run.
     """
-    from oc8.collab.emit import emit_event
+    from oc8.agent.tool_idempotency import REPLAY_NOTE
+    from oc8.collab.emit import emit_event_outcome
     from oc8.collab.handoff import PayloadInvalid
 
     event_type = str(tc.arguments["event_type"])
@@ -1244,7 +1245,7 @@ async def _emit(
         # binding whose schema rejects the payload must not leave the earlier
         # ones behind as a half-delivered event.
         async with db.begin_nested():
-            handoffs = await emit_event(
+            emitted = await emit_event_outcome(
                 db,
                 tenant_id=tenant_id,
                 source_department=dept,
@@ -1257,46 +1258,59 @@ async def _emit(
         return f"ERROR: event {event_type!r} is not in your department's contract"
     except PayloadInvalid as exc:
         return f"ERROR: the receiving department's contract rejects this payload: {exc}"
-    if not handoffs:
+    if not emitted.handoffs:
         return (
             f"ERROR: no department takes {event_type!r} in (no contract binding, or the "
             "receiver's intakes do not accept it) -- nothing was handed over. Tell a "
             "human instead of trying another way."
         )
-    names: list[str] = []
-    for h in handoffs:
+    names: dict[uuid.UUID, str] = {}
+    for h in emitted.handoffs:
         target = await db.get(m.Department, h.target_department_id)
-        names.append(target.name if target is not None else str(h.target_department_id))
-    await append_event(
-        db,
-        tenant_id=tenant_id,
-        actor_type="agent",
-        actor_id=agent.id,
-        category="contract",
-        action=f"emit:{event_type}",
-        resource={
-            "department_id": str(dept.id),
-            "task_id": str(task.id),
-            "handoff_ids": [str(h.id) for h in handoffs],
-        },
-        decision="allow",
-        originating_operator=originating_operator,
-    )
-    await record_activity(
-        db,
-        tenant_id=tenant_id,
-        agent_id=agent.id,
-        status="info",
-        message=f"Übergabe an {', '.join(names)}: {event_type}",
-    )
-    listing = ", ".join(
-        f"{n} (Übergabe {h.id}, {h.status})" for n, h in zip(names, handoffs, strict=True)
-    )
-    return (
-        f"Übergeben an {listing}. Die Abteilung muss die Übergabe annehmen, bevor dort "
-        "jemand daran arbeitet -- erledige den Teil nicht selbst und übergib ihn nicht "
-        "ein zweites Mal."
-    )
+        names[h.id] = target.name if target is not None else str(h.target_department_id)
+    new = emitted.new
+    if new:
+        # Audit and activity record what HAPPENED: only handoffs this call
+        # created. A replay (resumed run, same emission) is already on record
+        # from the call that did it, and counting it again would overstate
+        # how much work crossed the border.
+        await append_event(
+            db,
+            tenant_id=tenant_id,
+            actor_type="agent",
+            actor_id=agent.id,
+            category="contract",
+            action=f"emit:{event_type}",
+            resource={
+                "department_id": str(dept.id),
+                "task_id": str(task.id),
+                "handoff_ids": [str(h.id) for h in new],
+            },
+            decision="allow",
+            originating_operator=originating_operator,
+        )
+        await record_activity(
+            db,
+            tenant_id=tenant_id,
+            agent_id=agent.id,
+            status="info",
+            message=f"Übergabe an {', '.join(names[h.id] for h in new)}: {event_type}",
+        )
+
+    def _listing(rows: list[m.Handoff]) -> str:
+        return ", ".join(f"{names[h.id]} (Übergabe {h.id}, {h.status})" for h in rows)
+
+    parts: list[str] = []
+    if new:
+        parts.append(
+            f"Übergeben an {_listing(new)}. Die Abteilung muss die Übergabe annehmen, "
+            "bevor dort jemand daran arbeitet -- erledige den Teil nicht selbst und "
+            "übergib ihn nicht ein zweites Mal."
+        )
+    replays = [h for h in emitted.handoffs if h.id in emitted.replayed_ids]
+    if replays:
+        parts.append(f"Schon früher übergeben an {_listing(replays)}.\n\n{REPLAY_NOTE}")
+    return "\n\n".join(parts)
 
 
 async def _department_frame(db: AsyncSession, agent: m.Agent) -> dict[str, Any]:
