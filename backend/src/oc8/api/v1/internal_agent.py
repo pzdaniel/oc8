@@ -65,6 +65,7 @@ from oc8.authz.pdp import (
     required_right,
 )
 from oc8.capas.discovery import resolve_tool_pack_connection
+from oc8.collab.contracts import department_emits
 from oc8.config import get_settings
 from oc8.metering import record_usage
 from oc8.modelrouter import (
@@ -412,6 +413,7 @@ async def step(
         has_instruction_files=has_instruction_files,
         copilot_permissions=copilot_permissions,
         offer_write_output_file=offer_write_output_file,
+        emits=department_emits(dept.frame if dept is not None else {}),
     )
 
     resolved_tools = tools

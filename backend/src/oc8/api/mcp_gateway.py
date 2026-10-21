@@ -35,11 +35,14 @@ from oc8.agent.control_tools import (
     ASK_USER,
     CONTROL_TOOL_NAMES,
     DELEGATE_TASK,
+    EMIT_EVENT,
     MEMORY_WRITE,
     RENDER_COMPONENT,
     REQUEST_DECISION,
     SEARCH_KNOWLEDGE,
     SEARCH_MEMORY,
+    authorize_emit,
+    emit_event_tool,
     execute_control_tool,
 )
 from oc8.agent.engine import _authorize, _call_sig
@@ -76,6 +79,7 @@ from oc8.authz.pdp import (
     required_right,
 )
 from oc8.capas.discovery import resolve_tool_pack_connection
+from oc8.collab.contracts import department_emits
 from oc8.memory.policy import authorize_memory_write
 from oc8.realtime.emit import note_focus, record_activity
 from oc8.runtime.approval_resume import pre_decided_map
@@ -442,6 +446,10 @@ async def _list_tools(
         # tool she was told to call was not on her list. Withheld from a
         # non-lead for the reason above: every call would be denied.
         core.append(DELEGATE_TASK)
+    # Same rule as control_tools.offered_tools: offered only to an agent whose
+    # department declares events, with exactly those as the enum.
+    if department_emits(frame):
+        core.append(emit_event_tool(department_emits(frame)))
     for core_tool in core:
         out.append(
             {
@@ -670,6 +678,7 @@ async def _call_tool(
         MEMORY_WRITE.name,
         DELEGATE_TASK.name,
         RENDER_COMPONENT.name,
+        EMIT_EVENT.name,
     ):
         if run.task_id is None:
             return _tool_result(
@@ -708,6 +717,10 @@ async def _call_tool(
                 tool_scopes=None,
                 connection_key=None,
             )
+        elif name == EMIT_EVENT.name:
+            # Not waved through either: the contract on the frame is the whole
+            # of what this tool may do, so it is checked like delegate_task's.
+            core_decision = authorize_emit(frame, arguments)
         else:
             core_decision = Decision(Effect.ALLOW)
         outcome = await execute_control_tool(

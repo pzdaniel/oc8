@@ -24,6 +24,7 @@ from oc8.agent import cache_flow
 from oc8.agent.control_tools import (
     DEPTH_LIMIT_REASON,
     MAX_DELEGATION_DEPTH,
+    authorize_emit,
     execute_control_tool,
     offered_tools,
 )
@@ -68,6 +69,7 @@ from oc8.capas.claude_hooks.context import (
 )
 from oc8.capas.discovery import resolve_tool_pack_connection
 from oc8.coding.tools import CODING_FRAME_KEY, CODING_TOOL_RIGHTS, Toolset
+from oc8.collab.contracts import department_emits
 from oc8.config import get_settings
 from oc8.hooks.bus import dispatch_filter
 from oc8.hooks.executor import InProcessExecutor
@@ -426,6 +428,13 @@ def _authorize(
         if delegation_depth + 1 > MAX_DELEGATION_DEPTH:
             return Decision(Effect.DENY, DEPTH_LIMIT_REASON)
         return Decision(Effect.ALLOW)
+    if tc.name == "emit_event":
+        # Decided against the contract on the department frame, never against
+        # a connection: it belongs to none, and falling through would DENY
+        # every call (and audit it as such). What it may emit is the frame's
+        # `emits`; where it lands is decided by emit_event (bindings + the
+        # receiver's intakes), which only ever creates a pending handoff.
+        return authorize_emit(frame, tc.arguments)
     if tc.name == "memory_write":
         content = str(tc.arguments.get("content", ""))
         tier = str(tc.arguments.get("tier", ""))
@@ -837,6 +846,7 @@ async def run_agent(
                     # The in-process engine is the one runtime with no
                     # /workspace mount of its own -- see offered_tools' docstring.
                     offer_write_output_file=True,
+                    emits=department_emits(frame),
                 )
 
             # Advisory loop-hygiene guard (track_repeat_tool_call, shared with the

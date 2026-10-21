@@ -1,0 +1,326 @@
+"""An agent hands work to ANOTHER department through the department contracts.
+
+Delegation stops at the department border on purpose (only the tenant
+Assistant may cross it). Work that belongs to another department -- a buyer's
+agent that found an article missing, say, and the department that creates
+articles -- crosses through the contract instead: the source department
+declares what it EMITS, the target what it TAKES IN, a binding connects the
+two, and the result is a PENDING handoff someone in the target department
+accepts. These tests pin that the tool can do exactly that and nothing more.
+"""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any
+
+import pytest
+from sqlalchemy import select
+
+from oc8 import models as m
+from oc8.agent.control_tools import (
+    EMIT_EVENT,
+    MAX_EMIT_PAYLOAD_BYTES,
+    authorize_emit,
+    execute_control_tool,
+    offered_tools,
+)
+from oc8.agent.engine import _authorize
+from oc8.authz.pdp import Decision, Effect
+from oc8.collab.handoff import create_handoff_type
+from oc8.modelrouter import ToolCall
+from tests.conftest import AppSessionFactory
+
+pytestmark = pytest.mark.asyncio
+
+EVENT = "einkauf.artikel.fehlt"
+HANDOFF = "artikel.anlegen"
+
+
+async def _setup(
+    db: Any,
+    tenant: uuid.UUID,
+    *,
+    target_intakes: bool = True,
+    schema: dict[str, Any] | None = None,
+) -> tuple[m.Department, m.Department, m.Agent, m.Task]:
+    """Einkauf (emits EVENT) -> Stammdaten (takes HANDOFF in), one binding."""
+    einkauf = m.Department(tenant_id=tenant, name="Einkauf", frame={"emits": [EVENT]})
+    stamm = m.Department(
+        tenant_id=tenant,
+        name="Stammdaten",
+        frame=(
+            {"intakes": [{"handoff_type": HANDOFF, "route": "Team Lead", "gate": "auto"}]}
+            if target_intakes
+            else {}
+        ),
+    )
+    db.add_all([einkauf, stamm])
+    await db.flush()
+    ht = await create_handoff_type(
+        db,
+        tenant_id=tenant,
+        name=HANDOFF,
+        payload_schema=schema or {"type": "object", "required": ["artikel"]},
+    )
+    db.add(
+        m.ContractBinding(
+            tenant_id=tenant,
+            event_type=EVENT,
+            handoff_type_id=ht.id,
+            source_department_id=einkauf.id,
+            target_department_id=stamm.id,
+            payload_map={"artikel": "$.artikel", "lieferant": "$.lieferant"},
+        )
+    )
+    agent = m.Agent(tenant_id=tenant, department_id=einkauf.id, name="Angebote")
+    db.add(agent)
+    await db.flush()
+    task = m.Task(
+        tenant_id=tenant,
+        department_id=einkauf.id,
+        assigned_agent_id=agent.id,
+        title="Angebot Lieferant X",
+        state="in_progress",
+    )
+    db.add(task)
+    await db.flush()
+    return einkauf, stamm, agent, task
+
+
+def _call(**arguments: Any) -> ToolCall:
+    return ToolCall(id=str(uuid.uuid4()), name=EMIT_EVENT.name, arguments=arguments)
+
+
+ARGS: dict[str, Any] = {
+    "event_type": EVENT,
+    "payload": {"artikel": "Rüttelplatte BP 25", "lieferant": "X GmbH", "intern": "nicht weiter"},
+}
+
+
+async def _emit(
+    db: Any,
+    tenant: uuid.UUID,
+    agent: m.Agent,
+    task: m.Task,
+    frame: dict[str, Any],
+    args: dict[str, Any] | None = None,
+) -> str:
+    tc = _call(**(args if args is not None else ARGS))
+    outcome = await execute_control_tool(
+        db,
+        tenant_id=tenant,
+        agent=agent,
+        task=task,
+        tc=tc,
+        decision=authorize_emit(frame, tc.arguments),
+        assigned_skills=[],
+        active_skills=[],
+        mcp_conn=None,
+        originating_operator=None,
+    )
+    assert outcome is not None
+    assert outcome.suspend is None  # it hands over and carries on, never parks
+    assert outcome.pending_run is None  # no run is started anywhere
+    return outcome.output
+
+
+async def _handoffs(db: Any) -> list[m.Handoff]:
+    return list((await db.execute(select(m.Handoff))).scalars().all())
+
+
+async def test_the_event_becomes_a_pending_handoff_in_the_other_department(
+    app_session: AppSessionFactory,
+) -> None:
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, stamm, agent, task = await _setup(db, tenant)
+        output = await _emit(db, tenant, agent, task, einkauf.frame)
+
+        assert output.startswith("Übergeben an Stammdaten")
+        [handoff] = await _handoffs(db)
+        assert handoff.status == "pending"  # waits for the target to accept it
+        assert handoff.target_department_id == stamm.id
+        assert handoff.source_department_id == einkauf.id
+        assert handoff.source_task_id == task.id
+        assert handoff.created_by == agent.id
+        # The contract's payload map decides what crosses, not the agent.
+        assert handoff.payload == {"artikel": "Rüttelplatte BP 25", "lieferant": "X GmbH"}
+        # Nothing was put on anybody's desk yet: that happens on acceptance.
+        assert handoff.target_task_id is None
+        audit = (
+            await db.execute(
+                select(m.AuditEvent).where(
+                    m.AuditEvent.category == "contract", m.AuditEvent.action == f"emit:{EVENT}"
+                )
+            )
+        ).scalar_one()
+        assert audit.decision == "allow"
+        assert audit.actor_id == agent.id
+        assert audit.resource["handoff_ids"] == [str(handoff.id)]
+
+
+async def test_an_event_outside_the_contract_is_refused(
+    app_session: AppSessionFactory,
+) -> None:
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, _stamm, agent, task = await _setup(db, tenant)
+        args = {**ARGS, "event_type": "einkauf.bestellung.freigeben"}
+        decision = authorize_emit(einkauf.frame, args)
+        assert decision.effect is Effect.DENY
+        assert "not in your department's contract" in decision.reason
+        output = await _emit(db, tenant, agent, task, einkauf.frame, args)
+        assert output.startswith("ERROR:")
+        assert await _handoffs(db) == []
+
+
+async def test_a_department_without_emits_cannot_emit_at_all(
+    app_session: AppSessionFactory,
+) -> None:
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        _einkauf, stamm, _agent, _task = await _setup(db, tenant)
+        decision = authorize_emit(stamm.frame, ARGS)
+        assert decision.effect is Effect.DENY
+        assert decision.reason == "your department declares no events it may emit"
+        assert authorize_emit({}, ARGS).effect is Effect.DENY
+
+
+async def test_a_target_that_does_not_take_it_in_gets_nothing(
+    app_session: AppSessionFactory,
+) -> None:
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, _stamm, agent, task = await _setup(db, tenant, target_intakes=False)
+        output = await _emit(db, tenant, agent, task, einkauf.frame)
+        assert output.startswith("ERROR: no department takes")
+        assert await _handoffs(db) == []
+        denied = (
+            await db.execute(select(m.AuditEvent).where(m.AuditEvent.action == f"intake:{HANDOFF}"))
+        ).scalar_one()
+        assert denied.decision == "deny"
+
+
+async def test_another_department_declaring_the_same_event_does_not_use_this_binding(
+    app_session: AppSessionFactory,
+) -> None:
+    """The binding belongs to its SOURCE department: an agent elsewhere that
+    declares the same event name does not get to ride on it."""
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        _einkauf, _stamm, _agent, _task = await _setup(db, tenant)
+        vertrieb = m.Department(tenant_id=tenant, name="Vertrieb", frame={"emits": [EVENT]})
+        db.add(vertrieb)
+        await db.flush()
+        other = m.Agent(tenant_id=tenant, department_id=vertrieb.id, name="Vertrieb-Agent")
+        db.add(other)
+        await db.flush()
+        other_task = m.Task(
+            tenant_id=tenant,
+            department_id=vertrieb.id,
+            assigned_agent_id=other.id,
+            title="x",
+            state="in_progress",
+        )
+        db.add(other_task)
+        await db.flush()
+        output = await _emit(db, tenant, other, other_task, vertrieb.frame)
+        assert output.startswith("ERROR: no department takes")
+        assert await _handoffs(db) == []
+
+
+async def test_the_frame_is_checked_again_against_the_department_as_it_is_now(
+    app_session: AppSessionFactory,
+) -> None:
+    """A long run authorised against the frame it read at the start must not
+    keep emitting after the event was taken out of the contract."""
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, _stamm, agent, task = await _setup(db, tenant)
+        stale_frame = dict(einkauf.frame)
+        einkauf.frame = {"emits": []}
+        await db.flush()
+        output = await _emit(db, tenant, agent, task, stale_frame)
+        assert output.startswith("ERROR:")
+        assert await _handoffs(db) == []
+        refused = (
+            await db.execute(select(m.AuditEvent).where(m.AuditEvent.action == f"emit:{EVENT}"))
+        ).scalar_one()
+        assert refused.decision == "deny"
+
+
+async def test_a_too_large_payload_is_refused(app_session: AppSessionFactory) -> None:
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, _stamm, agent, task = await _setup(db, tenant)
+        args = {"event_type": EVENT, "payload": {"artikel": "x" * (MAX_EMIT_PAYLOAD_BYTES + 1)}}
+        decision = authorize_emit(einkauf.frame, args)
+        assert decision.effect is Effect.DENY
+        assert "payload too large" in decision.reason
+        output = await _emit(db, tenant, agent, task, einkauf.frame, args)
+        assert output.startswith("ERROR: payload too large")
+        assert await _handoffs(db) == []
+
+
+async def test_a_payload_the_target_contract_rejects_leaves_no_handoff_behind(
+    app_session: AppSessionFactory,
+) -> None:
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, _stamm, agent, task = await _setup(
+            db, tenant, schema={"type": "object", "required": ["artikel", "menge"]}
+        )
+        output = await _emit(db, tenant, agent, task, einkauf.frame)
+        assert output.startswith("ERROR: the receiving department's contract rejects")
+        assert await _handoffs(db) == []
+
+
+async def test_emitting_the_same_thing_twice_from_one_task_hands_it_over_once(
+    app_session: AppSessionFactory,
+) -> None:
+    """A resumed run re-runs from the start; the work must not arrive twice."""
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, _stamm, agent, task = await _setup(db, tenant)
+        first = await _emit(db, tenant, agent, task, einkauf.frame)
+        second = await _emit(db, tenant, agent, task, einkauf.frame)
+        [handoff] = await _handoffs(db)
+        assert str(handoff.id) in first
+        assert str(handoff.id) in second
+        # A different article from the same task is a different handoff.
+        await _emit(
+            db,
+            tenant,
+            agent,
+            task,
+            einkauf.frame,
+            {"event_type": EVENT, "payload": {"artikel": "Stampfer"}},
+        )
+        assert len(await _handoffs(db)) == 2
+
+
+async def test_offered_only_with_emits_and_with_exactly_those_events() -> None:
+    agent = m.Agent(tenant_id=uuid.uuid4(), department_id=uuid.uuid4(), name="a")
+    without = offered_tools(agent, assigned_skills=[], active_skills=[], mcp_tools=[])
+    assert EMIT_EVENT.name not in {t.name for t in without}
+    offered = offered_tools(
+        agent, assigned_skills=[], active_skills=[], mcp_tools=[], emits=[EVENT]
+    )
+    [tool] = [t for t in offered if t.name == EMIT_EVENT.name]
+    assert tool.parameters["properties"]["event_type"]["enum"] == [EVENT]
+
+
+async def test_the_engine_pep_decides_it_against_the_contract_not_a_connection() -> None:
+    """Without its own branch the call would fall through to the connection
+    check and be DENIED (and audited as such) for want of a connection."""
+    agent = m.Agent(tenant_id=uuid.uuid4(), department_id=uuid.uuid4(), name="a")
+    common: dict[str, Any] = {
+        "tool_policies": {},
+        "connection_key": None,
+        "tool_scopes": None,
+    }
+    allowed = _authorize(agent, _call(**ARGS), frame={"emits": [EVENT]}, **common)
+    assert allowed == Decision(Effect.ALLOW)
+    denied = _authorize(agent, _call(**ARGS), frame={"emits": ["anderes"]}, **common)
+    assert denied.effect is Effect.DENY

@@ -5,7 +5,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import cast, select
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from oc8 import models as m
@@ -27,7 +28,16 @@ async def emit_event(
     event_type: str,
     payload: dict[str, Any],
     created_by: uuid.UUID,
+    source_task_id: uuid.UUID | None = None,
 ) -> list[m.Handoff]:
+    """Create one pending handoff per matching binding whose target takes it in.
+
+    `source_task_id` is set when an AGENT emits (control tool `emit_event`):
+    it is recorded on the handoff, and an identical handoff this same task
+    already produced is returned instead of being created again. A run that is
+    resumed re-runs from the start, so without this every resume of a run that
+    emitted before parking would hand the same work over a second time.
+    """
     if event_type not in department_emits(source_department.frame):
         await append_event(
             db,
@@ -75,6 +85,19 @@ async def emit_event(
             )
             continue
         mapped = apply_payload_map(binding.payload_map, payload)
+        if source_task_id is not None:
+            existing = await db.scalar(
+                select(m.Handoff).where(
+                    m.Handoff.source_task_id == source_task_id,
+                    m.Handoff.source_department_id == source_department.id,
+                    m.Handoff.target_department_id == target.id,
+                    m.Handoff.handoff_type_id == handoff_type.id,
+                    m.Handoff.payload == cast(mapped, JSONB),
+                )
+            )
+            if existing is not None:
+                created.append(existing)
+                continue
         handoff = await create_handoff(
             db,
             tenant_id=tenant_id,
@@ -83,6 +106,7 @@ async def emit_event(
             target_department_id=target.id,
             payload=mapped,
             created_by=created_by,
+            source_task_id=source_task_id,
             gate=binding.gate,
         )
         created.append(handoff)

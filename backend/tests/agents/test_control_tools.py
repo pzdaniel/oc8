@@ -181,6 +181,7 @@ def test_control_tool_names_matches_the_schemas() -> None:
         "memory_write",
         "ask_user",
         "delegate_task",
+        "emit_event",
         "request_decision",
         "search_knowledge",
         "search_memory",
