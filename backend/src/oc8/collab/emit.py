@@ -58,10 +58,14 @@ async def emit_event(
     bindings = (
         (
             await db.execute(
-                select(m.ContractBinding).where(
+                select(m.ContractBinding)
+                .where(
                     m.ContractBinding.event_type == event_type,
                     m.ContractBinding.source_department_id == source_department.id,
                 )
+                # Rows the session already holds would otherwise come back as
+                # they were when first loaded; the contract is read as it is NOW.
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -70,8 +74,8 @@ async def emit_event(
 
     created: list[m.Handoff] = []
     for binding in bindings:
-        target = await db.get(m.Department, binding.target_department_id)
-        handoff_type = await db.get(m.HandoffType, binding.handoff_type_id)
+        target = await db.get(m.Department, binding.target_department_id, populate_existing=True)
+        handoff_type = await db.get(m.HandoffType, binding.handoff_type_id, populate_existing=True)
         if target is None or handoff_type is None:
             continue
         if department_intake(target.frame, handoff_type.name) is None:

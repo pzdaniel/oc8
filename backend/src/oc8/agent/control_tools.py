@@ -1216,7 +1216,10 @@ async def _emit(
 
     event_type = str(tc.arguments["event_type"])
     payload = dict(tc.arguments.get("payload") or {})
-    dept = await db.get(m.Department, agent.department_id)
+    # populate_existing: the engine loaded this same row into the session at
+    # the start of the run, and a plain get() would hand back THAT object --
+    # the frame as it was then, not as an operator may have changed it since.
+    dept = await db.get(m.Department, agent.department_id, populate_existing=True)
     if dept is None or dept.deleted_at is not None:
         return "ERROR: you are not in a department, so there is no contract to emit under"
     if event_type not in department_emits(dept.frame or {}):

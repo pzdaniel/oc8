@@ -397,3 +397,33 @@ async def test_two_runs_emitting_at_the_same_moment_create_one_handoff(
     assert first == second
     async with app_session(tenant) as db:
         assert len(await _handoffs(db)) == 1
+
+
+async def test_an_event_revoked_while_the_run_is_going_is_refused(
+    app_session: AppSessionFactory,
+) -> None:
+    """The run's session loaded the department at its start (engine.py does);
+    an operator then takes the event out of the contract in another
+    transaction. The re-check must read the row as it is NOW, not the copy the
+    session's identity map still holds."""
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, _stamm, agent, task = await _setup(db, tenant)
+        dept_id = einkauf.id
+
+    async with app_session(tenant) as run_db:
+        dept = await run_db.get(m.Department, dept_id)  # as the engine does
+        assert dept is not None
+        frame_at_start = dict(dept.frame)
+        run_agent = await run_db.get(m.Agent, agent.id)
+        run_task = await run_db.get(m.Task, task.id)
+        assert run_agent is not None and run_task is not None
+
+        async with app_session(tenant) as operator_db:
+            changed = await operator_db.get(m.Department, dept_id)
+            assert changed is not None
+            changed.frame = {"emits": []}
+
+        output = await _emit(run_db, tenant, run_agent, run_task, frame_at_start)
+        assert output.startswith("ERROR:"), output
+        assert await _handoffs(run_db) == []
