@@ -13,6 +13,7 @@ connection's tools stay entirely the connection's business.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ from oc8.authz.pdp import Decision, Effect
 from oc8.authz.permissions import AGENT, APPROVAL, BUDGET, DEPARTMENT, STATISTICS, VIEW, perm
 from oc8.authz.scope import AgentActor, scope_for_member
 from oc8.capas.discovery import find_plugin
+from oc8.collab.contracts import ContractViolation, department_emits
 from oc8.departments.repo import visible_department, visible_departments
 from oc8.knowledge.retrieval import retrieve_kb_context
 from oc8.kpis.aggregate import compute_kpis
@@ -687,7 +689,103 @@ KPI_OVERVIEW = NeutralTool(
     },
 )
 
+
+# How large an emitted event's payload may be, serialised. A handoff is a
+# brief for another department, not a file transfer: anything bigger belongs
+# in an attachment or a record the receiver can look up.
+MAX_EMIT_PAYLOAD_BYTES = 16_384
+
+_EMIT_EVENT_DESCRIPTION = (
+    "Hand work over to ANOTHER department by reporting a business event your "
+    "department has declared (its contract's 'emits'). oc8 routes it along the "
+    "department contracts to every department that takes it in; there it waits "
+    "as a pending handoff until that department accepts it, and only then does "
+    "its team lead get the work. You do not choose the receiver and you cannot "
+    "start work there yourself -- if no department takes the event in, nothing "
+    "is handed over and you are told so. Put everything the receiver needs into "
+    "`payload`: they must be able to act without asking you."
+)
+
+
+def emit_event_tool(emits: Sequence[str] = ()) -> NeutralTool:
+    """The emit_event schema, with the department's own events as an enum.
+
+    The enum is what keeps the model from inventing event names: it is offered
+    exactly the events its department may emit. The authorisation check
+    (`authorize_emit`) does not rely on it -- a runtime that ignores the enum
+    is refused all the same.
+    """
+    event_type: dict[str, Any] = {
+        "type": "string",
+        "description": "One of the events your department may emit.",
+    }
+    if emits:
+        event_type["enum"] = list(emits)
+    return NeutralTool(
+        # Not "emit_event": a core tool name is matched BEFORE any connection's
+        # tools (execute_control_tool runs first, and CONTROL_TOOL_NAMES is a
+        # flat namespace shared with every MCP server), so a generic verb an
+        # event-bus connection might well expose itself would be hijacked.
+        # Same convention as delegate_task / request_decision: a name that says
+        # what the PLATFORM does.
+        name="handoff_to_department",
+        description=_EMIT_EVENT_DESCRIPTION,
+        parameters={
+            "type": "object",
+            "properties": {
+                "event_type": event_type,
+                "payload": {
+                    "type": "object",
+                    "description": (
+                        "The facts the receiving department needs, as key/value "
+                        "pairs (which keys reach them is set by the contract)."
+                    ),
+                },
+            },
+            "required": ["event_type", "payload"],
+        },
+    )
+
+
+EMIT_EVENT = emit_event_tool()
+
+
+def authorize_emit(frame: dict[str, Any], arguments: dict[str, Any]) -> Decision:
+    """PEP for emit_event: pure, against the source department's frame.
+
+    Only the checks that need no database live here -- the event must be one
+    the department declares, and the payload must be an object of bounded
+    size. Whether any department takes it in is decided by `emit_event`
+    itself (bindings + the target's intakes), because that needs the rows.
+    """
+    emits = department_emits(frame)
+    if not emits:
+        return Decision(Effect.DENY, "your department declares no events it may emit")
+    event_type = arguments.get("event_type")
+    if not isinstance(event_type, str) or not event_type.strip():
+        return Decision(Effect.DENY, "event_type must not be empty")
+    if event_type not in emits:
+        return Decision(
+            Effect.DENY,
+            f"event {event_type!r} is not in your department's contract "
+            f"(it may emit: {', '.join(emits)})",
+        )
+    payload = arguments.get("payload", {})
+    if not isinstance(payload, dict):
+        return Decision(Effect.DENY, "payload must be an object")
+    try:
+        size = len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        return Decision(Effect.DENY, "payload is not serialisable")
+    if size > MAX_EMIT_PAYLOAD_BYTES:
+        return Decision(
+            Effect.DENY, f"payload too large ({size} bytes, max {MAX_EMIT_PAYLOAD_BYTES})"
+        )
+    return Decision(Effect.ALLOW)
+
+
 CONTROL_TOOL_SCHEMAS: dict[str, NeutralTool] = {
+    EMIT_EVENT.name: EMIT_EVENT,
     MEMORY_WRITE.name: MEMORY_WRITE,
     TODO_WRITE.name: TODO_WRITE,
     ASK_USER.name: ASK_USER,
@@ -732,8 +830,14 @@ def offered_tools(
     has_instruction_files: bool = False,
     copilot_permissions: frozenset[str] = frozenset(),
     offer_write_output_file: bool = False,
+    emits: Sequence[str] = (),
 ) -> list[NeutralTool]:
     """The full tool list to offer the model this step.
+
+    `emits` are the events the agent's department may emit (its frame's
+    contract). emit_event is offered only when there is at least one, and
+    then with exactly those as its enum -- a tool every call to which is
+    refused would only invite calls that can never succeed.
 
     delegate_task is withheld from a non-lead deliberately: _authorize denies it
     for them on every call, so offering it would only invite calls that can never
@@ -778,6 +882,8 @@ def offered_tools(
         offered.append(ASK_USER)
     if agent.is_team_lead:
         offered.append(DELEGATE_TASK)
+    if emits:
+        offered.append(emit_event_tool(emits))
     if agent.is_tenant_assistant:
         # Only the Assistant is the one that talks to a human about how oc8
         # itself is set up, so only it has anything to propose. The dispatch
@@ -1082,6 +1188,129 @@ async def _delegate(
         tenant_id=tenant_id, agent_id=target.id, context=context, source="delegation"
     )
     return f"delegated to {target.name} (run {sub_run.id})", sub_run.id
+
+
+async def _emit(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    agent: m.Agent,
+    task: m.Task,
+    tc: ToolCall,
+    originating_operator: str | None,
+) -> str:
+    """Run an agent's emit_event through the department contracts (§14a.3).
+
+    The boundary this keeps is the one delegation keeps: an agent never starts
+    work in another department. All this can produce is a PENDING handoff,
+    created by the same `emit_event` the API uses -- the receiver's frame
+    (intakes) and the configured bindings decide who gets it, and somebody
+    there accepts it before `route_to_team_lead` puts it on a desk.
+
+    `authorize_emit` has already checked the frame; it is checked again here
+    against the department row as it is NOW, because the frame the caller
+    authorised against may have been read at the start of a long run.
+    """
+    from oc8.agent.tool_idempotency import REPLAY_NOTE
+    from oc8.collab.emit import emit_event_outcome
+    from oc8.collab.handoff import PayloadInvalid
+
+    event_type = str(tc.arguments["event_type"])
+    payload = dict(tc.arguments.get("payload") or {})
+    # populate_existing: the engine loaded this same row into the session at
+    # the start of the run, and a plain get() would hand back THAT object --
+    # the frame as it was then, not as an operator may have changed it since.
+    dept = await db.get(m.Department, agent.department_id, populate_existing=True)
+    if dept is None or dept.deleted_at is not None:
+        return "ERROR: you are not in a department, so there is no contract to emit under"
+    if event_type not in department_emits(dept.frame or {}):
+        # Checked here, outside the savepoint below, so the refusal stays in the
+        # audit trail: emit_event records the same denial itself, but inside the
+        # savepoint it would be rolled back together with everything else.
+        await append_event(
+            db,
+            tenant_id=tenant_id,
+            actor_type="agent",
+            actor_id=agent.id,
+            category="contract",
+            action=f"emit:{event_type}",
+            resource={"department_id": str(dept.id), "task_id": str(task.id)},
+            decision="deny",
+            reason="event not declared in department emits",
+            originating_operator=originating_operator,
+        )
+        return f"ERROR: event {event_type!r} is not in your department's contract"
+    try:
+        # A savepoint: emit_event flushes one handoff per binding, and a later
+        # binding whose schema rejects the payload must not leave the earlier
+        # ones behind as a half-delivered event.
+        async with db.begin_nested():
+            emitted = await emit_event_outcome(
+                db,
+                tenant_id=tenant_id,
+                source_department=dept,
+                event_type=event_type,
+                payload=payload,
+                created_by=agent.id,
+                source_task_id=task.id,
+            )
+    except ContractViolation:
+        return f"ERROR: event {event_type!r} is not in your department's contract"
+    except PayloadInvalid as exc:
+        return f"ERROR: the receiving department's contract rejects this payload: {exc}"
+    if not emitted.handoffs:
+        return (
+            f"ERROR: no department takes {event_type!r} in (no contract binding, or the "
+            "receiver's intakes do not accept it) -- nothing was handed over. Tell a "
+            "human instead of trying another way."
+        )
+    names: dict[uuid.UUID, str] = {}
+    for h in emitted.handoffs:
+        target = await db.get(m.Department, h.target_department_id)
+        names[h.id] = target.name if target is not None else str(h.target_department_id)
+    new = emitted.new
+    if new:
+        # Audit and activity record what HAPPENED: only handoffs this call
+        # created. A replay (resumed run, same emission) is already on record
+        # from the call that did it, and counting it again would overstate
+        # how much work crossed the border.
+        await append_event(
+            db,
+            tenant_id=tenant_id,
+            actor_type="agent",
+            actor_id=agent.id,
+            category="contract",
+            action=f"emit:{event_type}",
+            resource={
+                "department_id": str(dept.id),
+                "task_id": str(task.id),
+                "handoff_ids": [str(h.id) for h in new],
+            },
+            decision="allow",
+            originating_operator=originating_operator,
+        )
+        await record_activity(
+            db,
+            tenant_id=tenant_id,
+            agent_id=agent.id,
+            status="info",
+            message=f"Übergabe an {', '.join(names[h.id] for h in new)}: {event_type}",
+        )
+
+    def _listing(rows: list[m.Handoff]) -> str:
+        return ", ".join(f"{names[h.id]} (Übergabe {h.id}, {h.status})" for h in rows)
+
+    parts: list[str] = []
+    if new:
+        parts.append(
+            f"Übergeben an {_listing(new)}. Die Abteilung muss die Übergabe annehmen, "
+            "bevor dort jemand daran arbeitet -- erledige den Teil nicht selbst und "
+            "übergib ihn nicht ein zweites Mal."
+        )
+    replays = [h for h in emitted.handoffs if h.id in emitted.replayed_ids]
+    if replays:
+        parts.append(f"Schon früher übergeben an {_listing(replays)}.\n\n{REPLAY_NOTE}")
+    return "\n\n".join(parts)
 
 
 async def _department_frame(db: AsyncSession, agent: m.Agent) -> dict[str, Any]:
@@ -1719,6 +1948,20 @@ async def execute_control_tool(
             run_id=run_id,
         )
         return ControlOutcome(output=output, pending_run=sub_run_id)
+
+    if tc.name == EMIT_EVENT.name:
+        if decision.effect is not Effect.ALLOW:
+            return ControlOutcome(output=f"ERROR: {decision.reason or 'emit denied'}")
+        return ControlOutcome(
+            output=await _emit(
+                db,
+                tenant_id=tenant_id,
+                agent=agent,
+                task=task,
+                tc=tc,
+                originating_operator=originating_operator,
+            )
+        )
 
     if tc.name == PROPOSE_CHANGE.name:
         # The security boundary of this whole tool: it may only ever DRAFT.

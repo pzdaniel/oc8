@@ -2136,3 +2136,86 @@ async def test_a_connection_without_requirements_is_launched_verbatim(
     code, body = await _rpc(_token(tenant, agent_id, run_id), "tools/list")
     assert code == 200, body
     assert launched[-1] == ("python", ["-m", "bridge"])
+
+
+async def test_handoff_to_department_is_offered_and_hands_over_through_the_gateway(
+    app_session: AppSessionFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Container-run agents are the ones doing the work, so the contract route to
+    another department has to exist here too -- offered only when the agent's
+    department declares events, and ending in a PENDING handoff, never a run."""
+    from oc8.collab.handoff import create_handoff_type
+
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        agent_id, run_id, task_id = await _seed(
+            db, tenant, frame={**FRAME, "emits": ["einkauf.artikel.fehlt"]}
+        )
+        agent = await db.get(m.Agent, agent_id)
+        assert agent is not None
+        stamm = m.Department(
+            tenant_id=tenant,
+            name="Stammdaten",
+            frame={"intakes": [{"handoff_type": "artikel.anlegen", "gate": "auto"}]},
+        )
+        db.add(stamm)
+        await db.flush()
+        ht = await create_handoff_type(
+            db, tenant_id=tenant, name="artikel.anlegen", payload_schema={"type": "object"}
+        )
+        db.add(
+            m.ContractBinding(
+                tenant_id=tenant,
+                event_type="einkauf.artikel.fehlt",
+                handoff_type_id=ht.id,
+                source_department_id=agent.department_id,
+                target_department_id=stamm.id,
+                payload_map={"artikel": "$.artikel"},
+            )
+        )
+        await db.flush()
+        stamm_id = stamm.id
+    monkeypatch.setattr("oc8.agent.mcp_client.McpSession", _FakeMcp)
+    tok = _token(tenant, agent_id, run_id)
+
+    _c, listed = await _rpc(tok, "tools/list")
+    [tool] = [t for t in listed["result"]["tools"] if t["name"] == "handoff_to_department"]
+    assert tool["inputSchema"]["properties"]["event_type"]["enum"] == ["einkauf.artikel.fehlt"]
+
+    code, body = await _rpc(
+        tok,
+        "tools/call",
+        {
+            "name": "handoff_to_department",
+            "arguments": {"event_type": "einkauf.artikel.fehlt", "payload": {"artikel": "BP 25"}},
+        },
+    )
+    assert code == 200, body
+    assert body["result"].get("isError") is not True, body
+    _c, refused = await _rpc(
+        tok,
+        "tools/call",
+        {"name": "handoff_to_department", "arguments": {"event_type": "anderes", "payload": {}}},
+    )
+    assert refused["result"].get("isError") is True
+
+    async with app_session(tenant) as db:
+        [handoff] = (await db.execute(select(m.Handoff))).scalars().all()
+        assert handoff.status == "pending"
+        assert handoff.target_department_id == stamm_id
+        assert handoff.source_task_id == task_id
+        assert handoff.payload == {"artikel": "BP 25"}
+        runs = (await db.execute(select(m.AgentRun))).scalars().all()
+        assert [r.id for r in runs] == [run_id], "no work was started anywhere"
+
+
+async def test_handoff_to_department_is_not_offered_without_emits_in_the_contract(
+    app_session: AppSessionFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        agent_id, run_id, _t = await _seed(db, tenant)
+    monkeypatch.setattr("oc8.agent.mcp_client.McpSession", _FakeMcp)
+
+    _c, listed = await _rpc(_token(tenant, agent_id, run_id), "tools/list")
+    assert "handoff_to_department" not in [t["name"] for t in listed["result"]["tools"]]

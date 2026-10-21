@@ -92,6 +92,7 @@ async def create_handoff(
     source_task_id: uuid.UUID | None = None,
     gate: str = "auto",
     flow_run_id: uuid.UUID | None = None,
+    idempotency_key: str | None = None,
 ) -> Handoff:
     try:
         jsonschema.validate(payload, handoff_type.payload_schema)
@@ -108,6 +109,7 @@ async def create_handoff(
         gate=gate,
         created_by=created_by,
         status="pending",
+        idempotency_key=idempotency_key,
     )
     db.add(handoff)
     await db.flush()

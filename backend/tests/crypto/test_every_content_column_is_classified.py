@@ -141,6 +141,7 @@ EXEMPT: dict[str, str] = {
     "handoff.payload": "content column to encrypt as-is, not yet migrated, design spec §6a",
     "handoff.attachments": "content column to encrypt as-is, not yet migrated, design spec §6a",
     "handoff.status": "structural enum-like column (status/state/kind/classification/...), CHECK-constrained, not content, design spec §6c",
+    "handoff.idempotency_key": "exact-once key (source task id, binding id, sha256 of the mapped payload) -- an opaque identifier, equality-queried by collab.emit, same rationale as agent_run.idempotency_key, design spec §6b",
     "handoff.gate": "structural enum-like column (status/state/kind/classification/...), CHECK-constrained, not content, design spec §6c",
     "handoff_type.name": "dispatch-matched identifier, not customer content, design spec §6c",
     "handoff_type.payload_schema": "not individually named in spec section 6; structural/config/identifier column, not customer free text -- see design spec §6",
