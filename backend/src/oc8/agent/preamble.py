@@ -253,10 +253,49 @@ async def run_context(
         if task is not None
         else None
     )
-    return run_context_block(
-        now=now or dt.datetime.now(dt.UTC),
-        member=actor.member if actor is not None else None,
+    member = actor.member if actor is not None else None
+    if member is None:
+        member = await _member_behind_chat_run(db, tenant_id=tenant_id, run_id=run_id)
+    return run_context_block(now=now or dt.datetime.now(dt.UTC), member=member)
+
+
+async def _member_behind_chat_run(
+    db: AsyncSession, *, tenant_id: uuid.UUID, run_id: uuid.UUID | None
+) -> m.OrgMember | None:
+    """The person behind a chat CONTINUATION run, for the run context only.
+
+    When a chat-originated delegation finishes, `executor._maybe_wake_parent`
+    wakes the lead with a `source="chat"` run that carries the conversation's
+    `chat_session_id` but sits on a fresh task, not the one the session points
+    at -- so the task lookup above finds nobody, and the final, user-facing
+    answer would lose "me"/"my". Resolved here from the session the run itself
+    carries, with the same operator-mismatch check as `_resolve_agent_actor`.
+    Deliberately NOT used for any permission: this only names the person.
+    """
+    if run_id is None:
+        return None
+    run = await db.get(m.AgentRun, run_id)
+    if run is None or run.tenant_id != tenant_id or run.source != "chat":
+        return None
+    context = run.context or {}
+    try:
+        session_id = uuid.UUID(str(context.get("chat_session_id")))
+    except ValueError:
+        return None
+    session = await db.scalar(
+        select(m.ChatSession).where(
+            m.ChatSession.id == session_id, m.ChatSession.tenant_id == tenant_id
+        )
     )
+    if session is None:
+        return None
+    member = await db.get(m.OrgMember, session.member_id)
+    if member is None:
+        return None
+    operator = context.get("originating_operator")
+    if isinstance(operator, str) and operator and operator != member.subject:
+        return None
+    return member
 
 
 async def _gated_copilot_permissions(

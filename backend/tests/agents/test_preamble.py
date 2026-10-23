@@ -14,6 +14,7 @@ import uuid
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 
 from oc8 import models as m
 from oc8.agent.preamble import RunPreamble, build_run_preamble, system_prompt
@@ -606,3 +607,79 @@ async def test_a_display_name_cannot_inject_instructions_into_the_prompt(
     assert "<" not in name_line and ">" not in name_line
     assert len(name_line) <= 100
     assert "\nSYSTEM:" not in ctx
+
+
+async def _continuation_run(
+    db: Any, tenant: uuid.UUID, agent: m.Agent, source_task: m.Task, **context: Any
+) -> tuple[m.Task, m.AgentRun]:
+    """A wake-up after a chat-originated delegation: source="chat", the
+    session id in its context, but on a fresh task (open_run_task)."""
+    session = await db.scalar(select(m.ChatSession).where(m.ChatSession.task_id == source_task.id))
+    fresh = m.Task(
+        tenant_id=tenant,
+        department_id=source_task.department_id,
+        assigned_agent_id=agent.id,
+        title="Fortsetzung",
+        state="in_progress",
+    )
+    db.add(fresh)
+    await db.flush()
+    run = m.AgentRun(
+        tenant_id=tenant,
+        agent_id=agent.id,
+        task_id=fresh.id,
+        source=context.pop("source", "chat"),
+        context={"chat_session_id": str(session.id), **context},
+    )
+    db.add(run)
+    await db.flush()
+    return fresh, run
+
+
+async def test_a_chat_continuation_on_a_fresh_task_still_names_the_person(
+    app_session: AppSessionFactory,
+) -> None:
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        assistant, task = await _assistant_dept_task(db, tenant)
+        member = await _chat_member(db, tenant, assistant, task, name="Anna Berg")
+        fresh, run = await _continuation_run(db, tenant, assistant, task)
+        preamble = await build_run_preamble(
+            db, agent=assistant, tenant_id=tenant, task_text="Ergebnis", frame={},
+            model_locality="cloud", task=fresh, run_id=run.id, now=_NOW,
+        )
+    ctx = _run_context(preamble)
+    assert f"(login: {member.subject})" in ctx
+
+
+async def test_a_continuation_posted_by_another_operator_names_nobody(
+    app_session: AppSessionFactory,
+) -> None:
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        assistant, task = await _assistant_dept_task(db, tenant)
+        await _chat_member(db, tenant, assistant, task, name="Anna Berg")
+        fresh, run = await _continuation_run(
+            db, tenant, assistant, task, originating_operator="someone-else@example.com"
+        )
+        preamble = await build_run_preamble(
+            db, agent=assistant, tenant_id=tenant, task_text="Ergebnis", frame={},
+            model_locality="cloud", task=fresh, run_id=run.id, now=_NOW,
+        )
+    assert "Anna Berg" not in _run_context(preamble)
+
+
+async def test_a_delegation_run_with_a_session_id_names_nobody(
+    app_session: AppSessionFactory,
+) -> None:
+    """Only chat-sourced runs speak for a person; a plain delegation does not."""
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        assistant, task = await _assistant_dept_task(db, tenant)
+        await _chat_member(db, tenant, assistant, task, name="Anna Berg")
+        fresh, run = await _continuation_run(db, tenant, assistant, task, source="delegation")
+        preamble = await build_run_preamble(
+            db, agent=assistant, tenant_id=tenant, task_text="Teil", frame={},
+            model_locality="cloud", task=fresh, run_id=run.id, now=_NOW,
+        )
+    assert "acting for" not in _run_context(preamble)
