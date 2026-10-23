@@ -45,6 +45,7 @@ async def _delegated_setup(
     chat_session_id: str | None = None,
     chat_channel: str | None = None,
     chat_channel_external_id: str | None = None,
+    originating_operator: str | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
     """A team lead with a task, and a worker with a sub-task parented to it.
     Returns (lead agent id, sub-task id, sub-run id)."""
@@ -89,6 +90,8 @@ async def _delegated_setup(
             sub_run_context["chat_channel"] = chat_channel
         if chat_channel_external_id is not None:
             sub_run_context["chat_channel_external_id"] = chat_channel_external_id
+        if originating_operator is not None:
+            sub_run_context["originating_operator"] = originating_operator
 
         sub_run = await RunRepository(s).create(
             tenant_id=tenant,
@@ -231,6 +234,7 @@ async def test_a_chat_originated_sub_task_wakes_the_lead_with_source_chat(
         chat_session_id="11111111-1111-1111-1111-111111111111",
         chat_channel="teams",
         chat_channel_external_id="tg-42",
+        originating_operator="admin@example.com",
     )
     queue = _RecordingQueue()
     monkeypatch.setattr("oc8.runtime.intake.get_run_queue", lambda: queue)
@@ -256,6 +260,7 @@ async def test_a_chat_originated_sub_task_wakes_the_lead_with_source_chat(
         assert wake.context["chat_session_id"] == "11111111-1111-1111-1111-111111111111"
         assert wake.context["chat_channel"] == "teams"
         assert wake.context["chat_channel_external_id"] == "tg-42"
+        assert wake.context["originating_operator"] == "admin@example.com"
         assert expected_outcome in wake.context["task"]
 
 
@@ -267,7 +272,10 @@ async def test_a_chat_originated_sub_task_that_raises_still_wakes_with_source_ch
     code path from the normal terminal-state one above."""
     tenant = uuid.UUID(str(ACME_TENANT_ID))
     lead_id, _sub_task_id, sub_run_id = await _delegated_setup(
-        app_session, tenant, chat_session_id="22222222-2222-2222-2222-222222222222"
+        app_session,
+        tenant,
+        chat_session_id="22222222-2222-2222-2222-222222222222",
+        originating_operator="admin@example.com",
     )
     queue = _RecordingQueue()
     monkeypatch.setattr("oc8.runtime.intake.get_run_queue", lambda: queue)
@@ -284,6 +292,7 @@ async def test_a_chat_originated_sub_task_that_raises_still_wakes_with_source_ch
         assert wake.agent_id == lead_id
         assert wake.source == "chat"
         assert wake.context["chat_session_id"] == "22222222-2222-2222-2222-222222222222"
+        assert wake.context["originating_operator"] == "admin@example.com"
 
 
 async def test_a_team_leads_own_wake_up_task_does_not_wake_it_again(

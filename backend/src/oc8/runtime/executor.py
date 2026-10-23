@@ -231,6 +231,7 @@ async def _maybe_wake_parent(
     chat_session_id: str | None = None,
     chat_channel: str | None = None,
     chat_channel_external_id: str | None = None,
+    originating_operator: str | None = None,
 ) -> uuid.UUID | None:
     """Create a follow-up run for the team lead that delegated this sub-run, so
     it can react to the outcome (§7). Returns the new run's id for the caller to
@@ -310,6 +311,11 @@ async def _maybe_wake_parent(
         if chat_channel and chat_channel_external_id:
             context["chat_channel"] = chat_channel
             context["chat_channel_external_id"] = chat_channel_external_id
+        # Kept with the conversation for the same reason: the person behind a
+        # turn an operator posted in a colleague's session must not turn into
+        # the session owner one hop later.
+        if originating_operator:
+            context["originating_operator"] = originating_operator
     wake = await repo.create(
         tenant_id=tenant_id,
         agent_id=parent.assigned_agent_id,
@@ -849,6 +855,7 @@ async def execute_run(message: RunMessage, *, runtime: RuntimeAdapter | None = N
                         chat_channel_external_id=(run.context or {}).get(
                             "chat_channel_external_id"
                         ),
+                        originating_operator=(run.context or {}).get("originating_operator"),
                     )
                     if wake_id is not None:
                         pending_runs.append(wake_id)
@@ -966,6 +973,9 @@ async def execute_run(message: RunMessage, *, runtime: RuntimeAdapter | None = N
                                 chat_channel_external_id=(run.context or {}).get(
                                     "chat_channel_external_id"
                                 ),
+                                originating_operator=(run.context or {}).get(
+                                    "originating_operator"
+                                ),
                             )
                             if wake_id is not None:
                                 pending_runs.append(wake_id)
@@ -1045,6 +1055,7 @@ async def execute_run(message: RunMessage, *, runtime: RuntimeAdapter | None = N
                             chat_channel_external_id=(run.context or {}).get(
                                 "chat_channel_external_id"
                             ),
+                            originating_operator=(run.context or {}).get("originating_operator"),
                         )
                         if wake_id is not None:
                             pending_runs.append(wake_id)

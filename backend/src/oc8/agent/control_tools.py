@@ -1175,6 +1175,13 @@ async def _delegate(
                 if chat_channel and chat_channel_external_id:
                     context["chat_channel"] = chat_channel
                     context["chat_channel_external_id"] = chat_channel_external_id
+                # Who actually posted the turn rides along too: an operator
+                # replying in a colleague's session must stay recognisable at
+                # every hop, or the continuation would believe it acts for the
+                # session owner (preamble._member_behind_chat_run).
+                operator = executing_run.context.get("originating_operator")
+                if isinstance(operator, str) and operator:
+                    context["originating_operator"] = operator
     # Deferred import: oc8.runtime.executor reaches oc8.runtime.adapter, which
     # imports this module's own importer (oc8.agent.engine) at module level, so
     # importing it at the top would be a cycle. Resolved once, at first call.
