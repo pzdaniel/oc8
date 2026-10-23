@@ -544,3 +544,48 @@ async def test_a_lead_role_taken_away_during_the_run_is_refused(
         ).scalar_one()
         assert denied.decision == "deny"
         assert denied.reason == TEAM_LEAD_ONLY_REASON
+
+
+async def test_an_archived_lead_is_refused_even_though_the_flag_is_still_set(
+    app_session: AppSessionFactory,
+) -> None:
+    """delete_agent soft-deletes an agent that still has runs and leaves
+    is_team_lead untouched; the fresh check must treat an archived lead as no
+    lead at all, so archiving stops the handover at once."""
+    import datetime as dt
+
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, _stamm, agent, task = await _setup(db, tenant)
+        dept_id = einkauf.id
+
+    async with app_session(tenant) as run_db:
+        dept = await run_db.get(m.Department, dept_id)
+        assert dept is not None
+        frame_at_start = dict(dept.frame)
+        run_agent = await run_db.get(m.Agent, agent.id)
+        run_task = await run_db.get(m.Task, task.id)
+        assert run_agent is not None and run_task is not None
+
+        async with app_session(tenant) as operator_db:
+            archived = await operator_db.get(m.Agent, agent.id)
+            assert archived is not None
+            archived.deleted_at = dt.datetime.now(dt.UTC)
+            assert archived.is_team_lead
+
+        tc = _call(**ARGS)
+        outcome = await execute_control_tool(
+            run_db,
+            tenant_id=tenant,
+            agent=run_agent,
+            task=run_task,
+            tc=tc,
+            decision=authorize_emit(frame_at_start, tc.arguments, is_team_lead=True),
+            assigned_skills=[],
+            active_skills=[],
+            mcp_conn=None,
+            originating_operator=None,
+        )
+        assert outcome is not None
+        assert outcome.output == f"ERROR: {TEAM_LEAD_ONLY_REASON}"
+        assert await _handoffs(run_db) == []

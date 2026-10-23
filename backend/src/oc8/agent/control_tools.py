@@ -1242,11 +1242,14 @@ async def _emit(
     if dept is None or dept.deleted_at is not None:
         return "ERROR: you are not in a department, so there is no contract to emit under"
     # The lead flag is checked again for the same reason: an operator may have
-    # taken the lead role away during a long run. Read as a column, not via
-    # populate_existing on the Agent, so the engine's own pending changes to
-    # that row are not overwritten.
+    # taken the lead role away, or archived the agent (delete_agent soft-deletes
+    # an agent with dependent runs and leaves is_team_lead as it was), during a
+    # long run. Read as a column, not via populate_existing on the Agent, so the
+    # engine's own pending changes to that row are not overwritten.
     still_lead = (
-        await db.execute(select(m.Agent.is_team_lead).where(m.Agent.id == agent.id))
+        await db.execute(
+            select(m.Agent.is_team_lead).where(m.Agent.id == agent.id, m.Agent.deleted_at.is_(None))
+        )
     ).scalar_one_or_none()
     if not still_lead:
         await append_event(
