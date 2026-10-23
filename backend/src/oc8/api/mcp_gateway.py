@@ -446,9 +446,9 @@ async def _list_tools(
         # tool she was told to call was not on her list. Withheld from a
         # non-lead for the reason above: every call would be denied.
         core.append(DELEGATE_TASK)
-    # Same rule as control_tools.offered_tools: offered only to an agent whose
-    # department declares events, with exactly those as the enum.
-    if department_emits(frame):
+    # Same rule as control_tools.offered_tools: offered only to the team lead of
+    # a department that declares events, with exactly those as the enum.
+    if agent.is_team_lead and department_emits(frame):
         core.append(emit_event_tool(department_emits(frame)))
     for core_tool in core:
         out.append(
@@ -720,7 +720,7 @@ async def _call_tool(
         elif name == EMIT_EVENT.name:
             # Not waved through either: the contract on the frame is the whole
             # of what this tool may do, so it is checked like delegate_task's.
-            core_decision = authorize_emit(frame, arguments)
+            core_decision = authorize_emit(frame, arguments, is_team_lead=bool(agent.is_team_lead))
         else:
             core_decision = Decision(Effect.ALLOW)
         outcome = await execute_control_tool(

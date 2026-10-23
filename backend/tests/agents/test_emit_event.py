@@ -22,6 +22,7 @@ from oc8 import models as m
 from oc8.agent.control_tools import (
     EMIT_EVENT,
     MAX_EMIT_PAYLOAD_BYTES,
+    TEAM_LEAD_ONLY_REASON,
     authorize_emit,
     execute_control_tool,
     offered_tools,
@@ -76,7 +77,7 @@ async def _setup(
             payload_map={"artikel": "$.artikel", "lieferant": "$.lieferant"},
         )
     )
-    agent = m.Agent(tenant_id=tenant, department_id=einkauf.id, name="Angebote")
+    agent = m.Agent(tenant_id=tenant, department_id=einkauf.id, name="Angebote", is_team_lead=True)
     db.add(agent)
     await db.flush()
     task = m.Task(
@@ -116,7 +117,7 @@ async def _emit(
         agent=agent,
         task=task,
         tc=tc,
-        decision=authorize_emit(frame, tc.arguments),
+        decision=authorize_emit(frame, tc.arguments, is_team_lead=bool(agent.is_team_lead)),
         assigned_skills=[],
         active_skills=[],
         mcp_conn=None,
@@ -170,7 +171,7 @@ async def test_an_event_outside_the_contract_is_refused(
     async with app_session(tenant) as db:
         einkauf, _stamm, agent, task = await _setup(db, tenant)
         args = {**ARGS, "event_type": "einkauf.bestellung.freigeben"}
-        decision = authorize_emit(einkauf.frame, args)
+        decision = authorize_emit(einkauf.frame, args, is_team_lead=True)
         assert decision.effect is Effect.DENY
         assert "not in your department's contract" in decision.reason
         output = await _emit(db, tenant, agent, task, einkauf.frame, args)
@@ -184,10 +185,10 @@ async def test_a_department_without_emits_cannot_emit_at_all(
     tenant = uuid.uuid4()
     async with app_session(tenant) as db:
         _einkauf, stamm, _agent, _task = await _setup(db, tenant)
-        decision = authorize_emit(stamm.frame, ARGS)
+        decision = authorize_emit(stamm.frame, ARGS, is_team_lead=True)
         assert decision.effect is Effect.DENY
         assert decision.reason == "your department declares no events it may emit"
-        assert authorize_emit({}, ARGS).effect is Effect.DENY
+        assert authorize_emit({}, ARGS, is_team_lead=True).effect is Effect.DENY
 
 
 async def test_a_target_that_does_not_take_it_in_gets_nothing(
@@ -216,7 +217,9 @@ async def test_another_department_declaring_the_same_event_does_not_use_this_bin
         vertrieb = m.Department(tenant_id=tenant, name="Vertrieb", frame={"emits": [EVENT]})
         db.add(vertrieb)
         await db.flush()
-        other = m.Agent(tenant_id=tenant, department_id=vertrieb.id, name="Vertrieb-Agent")
+        other = m.Agent(
+            tenant_id=tenant, department_id=vertrieb.id, name="Vertrieb-Agent", is_team_lead=True
+        )
         db.add(other)
         await db.flush()
         other_task = m.Task(
@@ -258,7 +261,7 @@ async def test_a_too_large_payload_is_refused(app_session: AppSessionFactory) ->
     async with app_session(tenant) as db:
         einkauf, _stamm, agent, task = await _setup(db, tenant)
         args = {"event_type": EVENT, "payload": {"artikel": "x" * (MAX_EMIT_PAYLOAD_BYTES + 1)}}
-        decision = authorize_emit(einkauf.frame, args)
+        decision = authorize_emit(einkauf.frame, args, is_team_lead=True)
         assert decision.effect is Effect.DENY
         assert "payload too large" in decision.reason
         output = await _emit(db, tenant, agent, task, einkauf.frame, args)
@@ -304,7 +307,7 @@ async def test_emitting_the_same_thing_twice_from_one_task_hands_it_over_once(
 
 
 async def test_offered_only_with_emits_and_with_exactly_those_events() -> None:
-    agent = m.Agent(tenant_id=uuid.uuid4(), department_id=uuid.uuid4(), name="a")
+    agent = m.Agent(tenant_id=uuid.uuid4(), department_id=uuid.uuid4(), name="a", is_team_lead=True)
     without = offered_tools(agent, assigned_skills=[], active_skills=[], mcp_tools=[])
     assert EMIT_EVENT.name not in {t.name for t in without}
     offered = offered_tools(
@@ -317,7 +320,7 @@ async def test_offered_only_with_emits_and_with_exactly_those_events() -> None:
 async def test_the_engine_pep_decides_it_against_the_contract_not_a_connection() -> None:
     """Without its own branch the call would fall through to the connection
     check and be DENIED (and audited as such) for want of a connection."""
-    agent = m.Agent(tenant_id=uuid.uuid4(), department_id=uuid.uuid4(), name="a")
+    agent = m.Agent(tenant_id=uuid.uuid4(), department_id=uuid.uuid4(), name="a", is_team_lead=True)
     common: dict[str, Any] = {
         "tool_policies": {},
         "connection_key": None,
@@ -467,3 +470,77 @@ async def test_a_replay_says_so_and_is_not_recorded_as_a_second_handover(
             .all()
         )
         assert len(activities) == 1
+
+
+async def test_only_the_team_lead_is_offered_the_tool() -> None:
+    """A member reports to its lead; the lead decides whether the work goes to
+    another department. Offering it to a member would only invite calls that
+    are always denied."""
+    member = m.Agent(tenant_id=uuid.uuid4(), department_id=uuid.uuid4(), name="b")
+    offered = offered_tools(
+        member, assigned_skills=[], active_skills=[], mcp_tools=[], emits=[EVENT]
+    )
+    assert EMIT_EVENT.name not in {t.name for t in offered}
+
+
+async def test_a_member_is_refused_by_the_engine_pep_even_with_emits() -> None:
+    member = m.Agent(tenant_id=uuid.uuid4(), department_id=uuid.uuid4(), name="b")
+    decision = _authorize(
+        member,
+        _call(**ARGS),
+        frame={"emits": [EVENT]},
+        tool_policies={},
+        connection_key=None,
+        tool_scopes=None,
+    )
+    assert decision.effect is Effect.DENY
+    assert decision.reason == TEAM_LEAD_ONLY_REASON
+    assert authorize_emit({"emits": [EVENT]}, ARGS, is_team_lead=False) == decision
+
+
+async def test_a_lead_role_taken_away_during_the_run_is_refused(
+    app_session: AppSessionFactory,
+) -> None:
+    """The PEP saw a lead at the start of the run; an operator then takes the
+    lead role away. The dispatch reads the flag as it is NOW, hands nothing
+    over and leaves the refusal in the audit trail."""
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        einkauf, _stamm, agent, task = await _setup(db, tenant)
+        dept_id = einkauf.id
+
+    async with app_session(tenant) as run_db:
+        dept = await run_db.get(m.Department, dept_id)
+        assert dept is not None
+        frame_at_start = dict(dept.frame)
+        run_agent = await run_db.get(m.Agent, agent.id)
+        run_task = await run_db.get(m.Task, task.id)
+        assert run_agent is not None and run_task is not None
+        assert run_agent.is_team_lead
+
+        async with app_session(tenant) as operator_db:
+            changed = await operator_db.get(m.Agent, agent.id)
+            assert changed is not None
+            changed.is_team_lead = False
+
+        tc = _call(**ARGS)
+        outcome = await execute_control_tool(
+            run_db,
+            tenant_id=tenant,
+            agent=run_agent,
+            task=run_task,
+            tc=tc,
+            decision=authorize_emit(frame_at_start, tc.arguments, is_team_lead=True),
+            assigned_skills=[],
+            active_skills=[],
+            mcp_conn=None,
+            originating_operator=None,
+        )
+        assert outcome is not None
+        assert outcome.output == f"ERROR: {TEAM_LEAD_ONLY_REASON}"
+        assert await _handoffs(run_db) == []
+        denied = (
+            await run_db.execute(select(m.AuditEvent).where(m.AuditEvent.action == f"emit:{EVENT}"))
+        ).scalar_one()
+        assert denied.decision == "deny"
+        assert denied.reason == TEAM_LEAD_ONLY_REASON

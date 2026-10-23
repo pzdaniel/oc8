@@ -2153,6 +2153,7 @@ async def test_handoff_to_department_is_offered_and_hands_over_through_the_gatew
         )
         agent = await db.get(m.Agent, agent_id)
         assert agent is not None
+        agent.is_team_lead = True  # only a department's lead hands work over
         stamm = m.Department(
             tenant_id=tenant,
             name="Stammdaten",
@@ -2219,3 +2220,32 @@ async def test_handoff_to_department_is_not_offered_without_emits_in_the_contrac
 
     _c, listed = await _rpc(_token(tenant, agent_id, run_id), "tools/list")
     assert "handoff_to_department" not in [t["name"] for t in listed["result"]["tools"]]
+
+
+async def test_handoff_to_department_is_neither_offered_to_nor_run_by_a_member(
+    app_session: AppSessionFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same rule as in-process: only the team lead hands work to another
+    department. A member does not see the tool, and calling it anyway is refused
+    without creating anything."""
+    tenant = uuid.uuid4()
+    async with app_session(tenant) as db:
+        agent_id, run_id, _t = await _seed(
+            db, tenant, frame={**FRAME, "emits": ["einkauf.artikel.fehlt"]}
+        )
+    monkeypatch.setattr("oc8.agent.mcp_client.McpSession", _FakeMcp)
+    tok = _token(tenant, agent_id, run_id)
+
+    _c, listed = await _rpc(tok, "tools/list")
+    assert "handoff_to_department" not in [t["name"] for t in listed["result"]["tools"]]
+    _c, refused = await _rpc(
+        tok,
+        "tools/call",
+        {
+            "name": "handoff_to_department",
+            "arguments": {"event_type": "einkauf.artikel.fehlt", "payload": {"artikel": "BP 25"}},
+        },
+    )
+    assert refused["result"].get("isError") is True
+    async with app_session(tenant) as db:
+        assert (await db.execute(select(m.Handoff))).scalars().all() == []

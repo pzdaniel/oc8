@@ -750,14 +750,29 @@ def emit_event_tool(emits: Sequence[str] = ()) -> NeutralTool:
 EMIT_EVENT = emit_event_tool()
 
 
-def authorize_emit(frame: dict[str, Any], arguments: dict[str, Any]) -> Decision:
+TEAM_LEAD_ONLY_REASON = "only a team lead can hand work to another department"
+
+
+def authorize_emit(
+    frame: dict[str, Any], arguments: dict[str, Any], *, is_team_lead: bool
+) -> Decision:
     """PEP for emit_event: pure, against the source department's frame.
 
-    Only the checks that need no database live here -- the event must be one
-    the department declares, and the payload must be an object of bounded
-    size. Whether any department takes it in is decided by `emit_event`
-    itself (bindings + the target's intakes), because that needs the rows.
+    Only the checks that need no database live here -- the caller must be its
+    department's team lead, the event must be one the department declares, and
+    the payload must be an object of bounded size. Whether any department takes
+    it in is decided by `emit_event` itself (bindings + the target's intakes),
+    because that needs the rows.
+
+    Team lead only, like delegate_task: an accepted handoff lands on the
+    TARGET department's lead (`route_to_team_lead`), so the lead is the one
+    door of a department in both directions. A member that finds work for
+    another department reports it to its own lead, who decides whether to
+    hand it over -- one accountable sender per department, no duplicate or
+    ping-pong handoffs between individual agents.
     """
+    if not is_team_lead:
+        return Decision(Effect.DENY, TEAM_LEAD_ONLY_REASON)
     emits = department_emits(frame)
     if not emits:
         return Decision(Effect.DENY, "your department declares no events it may emit")
@@ -835,9 +850,10 @@ def offered_tools(
     """The full tool list to offer the model this step.
 
     `emits` are the events the agent's department may emit (its frame's
-    contract). emit_event is offered only when there is at least one, and
-    then with exactly those as its enum -- a tool every call to which is
-    refused would only invite calls that can never succeed.
+    contract). emit_event is offered only to the department's team lead and
+    only when there is at least one, and then with exactly those as its enum --
+    a tool every call to which is refused would only invite calls that can
+    never succeed.
 
     delegate_task is withheld from a non-lead deliberately: _authorize denies it
     for them on every call, so offering it would only invite calls that can never
@@ -882,7 +898,9 @@ def offered_tools(
         offered.append(ASK_USER)
     if agent.is_team_lead:
         offered.append(DELEGATE_TASK)
-    if emits:
+    # Team lead only, for the reason in authorize_emit; withheld from anyone
+    # else like delegate_task, because every call would be denied.
+    if emits and agent.is_team_lead:
         offered.append(emit_event_tool(emits))
     if agent.is_tenant_assistant:
         # Only the Assistant is the one that talks to a human about how oc8
@@ -1223,6 +1241,27 @@ async def _emit(
     dept = await db.get(m.Department, agent.department_id, populate_existing=True)
     if dept is None or dept.deleted_at is not None:
         return "ERROR: you are not in a department, so there is no contract to emit under"
+    # The lead flag is checked again for the same reason: an operator may have
+    # taken the lead role away during a long run. Read as a column, not via
+    # populate_existing on the Agent, so the engine's own pending changes to
+    # that row are not overwritten.
+    still_lead = (
+        await db.execute(select(m.Agent.is_team_lead).where(m.Agent.id == agent.id))
+    ).scalar_one_or_none()
+    if not still_lead:
+        await append_event(
+            db,
+            tenant_id=tenant_id,
+            actor_type="agent",
+            actor_id=agent.id,
+            category="contract",
+            action=f"emit:{event_type}",
+            resource={"department_id": str(dept.id), "task_id": str(task.id)},
+            decision="deny",
+            reason=TEAM_LEAD_ONLY_REASON,
+            originating_operator=originating_operator,
+        )
+        return f"ERROR: {TEAM_LEAD_ONLY_REASON}"
     if event_type not in department_emits(dept.frame or {}):
         # Checked here, outside the savepoint below, so the refusal stays in the
         # audit trail: emit_event records the same denial itself, but inside the

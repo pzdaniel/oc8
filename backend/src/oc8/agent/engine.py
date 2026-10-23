@@ -435,7 +435,7 @@ def _authorize(
         # every call (and audit it as such). What it may emit is the frame's
         # `emits`; where it lands is decided by emit_event (bindings + the
         # receiver's intakes), which only ever creates a pending handoff.
-        return authorize_emit(frame, tc.arguments)
+        return authorize_emit(frame, tc.arguments, is_team_lead=bool(agent.is_team_lead))
     if tc.name == "memory_write":
         content = str(tc.arguments.get("content", ""))
         tier = str(tc.arguments.get("tier", ""))
