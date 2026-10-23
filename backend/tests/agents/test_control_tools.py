@@ -474,6 +474,7 @@ async def test_delegate_task_carries_the_chat_origin_onto_the_sub_run(app_sessio
                 "chat_session_id": "aaaa-bbbb",
                 "chat_channel": "teams",
                 "chat_channel_external_id": "tg-7",
+                "originating_operator": "admin@example.com",
             },
         )
         db.add(executing_run)
@@ -502,6 +503,7 @@ async def test_delegate_task_carries_the_chat_origin_onto_the_sub_run(app_sessio
         assert sub.context["chat_session_id"] == "aaaa-bbbb"
         assert sub.context["chat_channel"] == "teams"
         assert sub.context["chat_channel_external_id"] == "tg-7"
+        assert sub.context["originating_operator"] == "admin@example.com"
 
 
 @pytest.mark.asyncio
